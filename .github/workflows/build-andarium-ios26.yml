@@ -1,0 +1,175 @@
+name: Build experimental Andarium for iOS 26
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ios26-experiment
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 360
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+      UML_APPLE_GPU_DEPENDENCY_JOBS: "3"
+      UML_IOS_NETWORK_DEPENDENCY_JOBS: "3"
+      UML_IOS_STORAGE_DEPENDENCY_JOBS: "3"
+      UML_IOS_ZSTD_DEPENDENCY_JOBS: "3"
+
+    steps:
+      - name: Check out the iOS 26 experiment
+        uses: actions/checkout@v4
+
+      - name: Show build environment
+        run: |
+          uname -a
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          df -h /
+
+      - name: Install build tools
+        run: |
+          brew install autoconf automake cmake gettext gperf libtool meson ninja pkg-config
+          python3 -m venv .build/python-venv
+          .build/python-venv/bin/python -m pip install mako packaging pyyaml
+          echo "$PWD/.build/python-venv/bin" >> "$GITHUB_PATH"
+          git config --global user.name "Andarium iOS 26 Builder"
+          git config --global user.email "actions@users.noreply.github.com"
+
+      - name: Install the Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Download accepted kernel and Android system
+        run: |
+          mkdir -p .build/kernel/artifacts .build/release-download
+          curl --fail --location --retry 3 \
+            --output .build/kernel.tar.gz \
+            https://github.com/imxieyi/Kernarium/releases/download/1.0b9-beta/android-6.18-arm64-4k-20261111-6.18.60-mc2.tar.gz
+          curl --fail --location --retry 3 \
+            --output .build/system.tar.gz \
+            https://github.com/imxieyi/Kernarium/releases/download/1.0b9-beta/lineage24-mainline6.18-4k-20261110-los24-r22.tar.gz
+          echo "79fc3acb85a347736fb27192c3a1c26ccfc21ba8ffbcc1a256f53b274b79856b  .build/kernel.tar.gz" | shasum -a 256 -c -
+          echo "0ba8a67798d79260221349cb9b749dd1bdfc1b679a55428fa1f6d12cd54c3aa2  .build/system.tar.gz" | shasum -a 256 -c -
+          tar -xzf .build/kernel.tar.gz -C .build/kernel/artifacts
+          tar -xzf .build/system.tar.gz -C .build/release-download
+          python3 android/lineage-24/tools/install-release.py \
+            --source "$PWD/.build/release-download/lineage24-mainline6.18-4k-20261110-los24-r22"
+          rm -f .build/kernel.tar.gz .build/system.tar.gz
+          rm -rf .build/release-download
+          df -h /
+
+      - name: Prepare pinned dependency sources
+        run: |
+          dependencies/prepare.sh --product apple-gpu-vulkan-experiment
+          dependencies/prepare.sh --product ios-network
+          dependencies/prepare.sh --product ios-storage
+          dependencies/prepare.sh --product ios-compression
+
+      - name: Build iOS 26 GPU and network dependencies
+        run: |
+          dependencies/build-apple-gpu.sh --platform ios --jobs 3
+          dependencies/build-ios-network.sh --platform ios --jobs 3
+          df -h /
+
+      - name: Build and package the Android runtime
+        run: |
+          cmake --preset kernarium-ios-device-android -DUML_IOS26_DIAGNOSTIC=ON
+          cmake --build --preset kernarium-ios-device-android --parallel 3
+          Kernarium/scripts/package-ios-frameworks.sh --runtimes android
+          Andarium/scripts/stage-system-image.py
+
+      - name: Build unsigned Andarium app
+        run: |
+          xcodebuild \
+            -project Andarium/Andarium.xcodeproj \
+            -scheme Andarium \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath .build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          APP=.build/DerivedData/Build/Products/Release-iphoneos/Andarium.app
+          test -d "$APP"
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
+          mkdir -p .build/ipa/Payload
+          cp -R "$APP" .build/ipa/Payload/
+          ditto -c -k --sequesterRsrc --keepParent .build/ipa/Payload \
+            .build/Andarium-iOS26-diagnostic-unsigned.ipa
+          shasum -a 256 .build/Andarium-iOS26-diagnostic-unsigned.ipa \
+            > .build/Andarium-iOS26-diagnostic-unsigned.ipa.sha256
+
+      - name: Upload experimental IPA
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: Andarium-iOS26-diagnostic-unsigned
+          path: |
+            .build/Andarium-iOS26-diagnostic-unsigned.ipa
+            .build/Andarium-iOS26-diagnostic-unsigned.ipa.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ios26-build-${{ github.run_number }}
+        run: |
+          {
+            echo 'Personal, unofficial build of Andarium for iOS 26.'
+            echo
+            echo 'Built by GitHub Actions from the ios26-experiment branch at the commit this release points to.'
+            echo 'Minimum iOS version: 26.0'
+            echo 'Unsigned IPA: it must be signed by a sideloading tool before it installs.'
+            echo 'Experimental: nothing about this build has been verified on a device.'
+            echo 'Diagnostic build: guest RAM can be lowered to 1 GiB and early startup failures show a specific -1041 through -1046 code.'
+            echo
+            echo "Source code: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}"
+            echo 'iOS 26 changes: https://github.com/1972nollus/Kernarium/tree/ios26-experiment'
+            echo 'Original project: https://github.com/imxieyi/Kernarium'
+            echo 'License: GPL-2.0-or-later.'
+          } > .build/release-notes.md
+          gh release create "$RELEASE_TAG" \
+            .build/Andarium-iOS26-diagnostic-unsigned.ipa \
+            .build/Andarium-iOS26-diagnostic-unsigned.ipa.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "Andarium iOS 26 build ${GITHUB_RUN_NUMBER}" \
+            --prerelease \
+            --notes-file .build/release-notes.md
+
+      # A sideloading tool reads the entitlements an application asks for from
+      # its signature, and an unsigned application has none to read. This second
+      # IPA is the same build signed ad hoc with Config/Andarium.entitlements.
+      - name: Publish ad hoc signed IPA with the memory entitlements
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ios26-build-${{ github.run_number }}
+        run: |
+          rm -f .build/Andarium-iOS26-diagnostic-unsigned.ipa
+          APP=.build/ipa/Payload/Andarium.app
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -mindepth 1 -maxdepth 1 \
+              \( -name '*.framework' -o -name '*.dylib' \) -print0 |
+              xargs -0 -n 1 /usr/bin/codesign --force --sign - --timestamp=none
+          fi
+          /usr/bin/codesign --force --sign - --timestamp=none \
+            --generate-entitlement-der \
+            --entitlements Andarium/Config/Andarium.entitlements "$APP"
+          /usr/bin/codesign --verify --strict "$APP"
+          /usr/bin/codesign -d --entitlements - "$APP"
+          ditto -c -k --sequesterRsrc --keepParent .build/ipa/Payload \
+            .build/Andarium-iOS26-diagnostic-adhoc.ipa
+          shasum -a 256 .build/Andarium-iOS26-diagnostic-adhoc.ipa \
+            > .build/Andarium-iOS26-diagnostic-adhoc.ipa.sha256
+          gh release upload "$RELEASE_TAG" \
+            .build/Andarium-iOS26-diagnostic-adhoc.ipa \
+            .build/Andarium-iOS26-diagnostic-adhoc.ipa.sha256
