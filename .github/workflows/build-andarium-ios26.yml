@@ -118,27 +118,58 @@ jobs:
           compression-level: 0
           retention-days: 14
 
-      - name: Publish permanent GitHub prerelease
+      - name: Publish GitHub prerelease
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ios26-build-${{ github.run_number }}
         run: |
           {
-            echo 'Unofficial experimental build from the ios26-experiment branch.'
+            echo 'Personal, unofficial build of Andarium for iOS 26.'
             echo
+            echo 'Built by GitHub Actions from the ios26-experiment branch at the commit this release points to.'
             echo 'Minimum iOS version: 26.0'
-            echo 'Unsigned IPA: signing through SideStore or another compatible signer is required.'
-            echo 'Confirmed: installation through SideStore and successful launch on iOS 26.6.1.'
-            echo 'Other app functionality remains experimental and has not been fully verified.'
+            echo 'Unsigned IPA: it must be signed by a sideloading tool before it installs.'
+            echo 'Experimental: nothing about this build has been verified on a device.'
             echo 'Diagnostic build: guest RAM can be lowered to 1 GiB and early startup failures show a specific -1041 through -1046 code.'
             echo
-            echo 'Source code: https://github.com/1972nollus/Kernarium/tree/ios26-experiment'
+            echo "Source code: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}"
+            echo 'iOS 26 changes: https://github.com/1972nollus/Kernarium/tree/ios26-experiment'
             echo 'Original project: https://github.com/imxieyi/Kernarium'
-            echo 'License: GNU GPL v2.'
+            echo 'License: GPL-2.0-or-later.'
           } > .build/release-notes.md
-          gh release create andarium-ios26-diagnostic-2 \
+          gh release create "$RELEASE_TAG" \
             .build/Andarium-iOS26-diagnostic-unsigned.ipa \
             .build/Andarium-iOS26-diagnostic-unsigned.ipa.sha256 \
             --target "$GITHUB_SHA" \
-            --title "Andarium iOS 26 diagnostic build 2" \
+            --title "Andarium iOS 26 build ${GITHUB_RUN_NUMBER}" \
             --prerelease \
             --notes-file .build/release-notes.md
+
+      # A sideloading tool reads the entitlements an application asks for from
+      # its signature, and an unsigned application has none to read. This second
+      # IPA is the same build signed ad hoc with Config/Andarium.entitlements.
+      - name: Publish ad hoc signed IPA with the memory entitlements
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ios26-build-${{ github.run_number }}
+        run: |
+          rm -f .build/Andarium-iOS26-diagnostic-unsigned.ipa
+          APP=.build/ipa/Payload/Andarium.app
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -mindepth 1 -maxdepth 1 \
+              \( -name '*.framework' -o -name '*.dylib' \) -print0 |
+              xargs -0 -n 1 /usr/bin/codesign --force --sign - --timestamp=none
+          fi
+          /usr/bin/codesign --force --sign - --timestamp=none \
+            --generate-entitlement-der \
+            --entitlements Andarium/Config/Andarium.entitlements "$APP"
+          /usr/bin/codesign --verify --strict "$APP"
+          /usr/bin/codesign -d --entitlements - "$APP"
+          ditto -c -k --sequesterRsrc --keepParent .build/ipa/Payload \
+            .build/Andarium-iOS26-diagnostic-adhoc.ipa
+          shasum -a 256 .build/Andarium-iOS26-diagnostic-adhoc.ipa \
+            > .build/Andarium-iOS26-diagnostic-adhoc.ipa.sha256
+          gh release upload "$RELEASE_TAG" \
+            .build/Andarium-iOS26-diagnostic-adhoc.ipa \
+            .build/Andarium-iOS26-diagnostic-adhoc.ipa.sha256
